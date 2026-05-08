@@ -1,6 +1,123 @@
 
 ---
 
+## Визуальный модуль (Стереокамера + Лазерная триангуляция)
+
+**Назначение:**  
+Захват стереопар и вспомогательных данных о глубине для последующей фотограмметрии и построения облака точек бетонных конструкций.
+
+### Оборудование
+- Стереокамера **GXVISION LS2MO1** (USB, разрешение 2560×720)
+- Лазерная линия 650 нм, 5 мВт (жёстко закреплена на штоке камеры)
+- Платформа: Raspberry Pi 4
+
+### Принцип работы
+Данные со стереокамеры используются для фотограмметрической обработки и построения 3D-модели.  
+Классическое стереозрение плохо справляется с однородными малотекстурированными поверхностями бетона. Для компенсации применяется **лазерная триангуляция** — лазер проецирует линию на поверхность, по положению которой с точностью до нескольких миллиметров определяется расстояние до объекта. Это значительно повышает плотность и качество итогового облака точек.
+
+### Используемые библиотеки
+- `picamera2`
+- `opencv-python`
+- `numpy`
+
+---
+
+### Захват стереопары (`camera.py`)
+
+```python
+from picamera2 import Picamera2
+import cv2
+import time
+
+class StereoCamera:
+    def __init__(self):
+        self.picam2 = Picamera2()
+        config = self.picam2.create_still_configuration(main={"size": (2560, 720)})
+        self.picam2.configure(config)
+        self.picam2.start()
+        time.sleep(2) 
+
+    def capture_stereo_pair(self):
+
+        frame = self.picam2.capture_array()
+        left = frame[:, :1280]
+        right = frame[:, 1280:]
+        return cv2.cvtColor(left, cv2.COLOR_BGR2RGB), cv2.cvtColor(right, cv2.COLOR_BGR2RGB)
+
+    def release(self):
+        self.picam2.stop()
+```
+
+---
+
+### Лазерная триангуляция (`laser_triangulation.py`)
+
+```python
+import cv2
+import numpy as np
+
+def extract_laser_line(image):
+    
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
+    mask = cv2.inRange(hsv, np.array([0, 80, 100]), np.array([30, 255, 255]))
+    
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    return mask
+
+
+def get_laser_points(mask, step=2, min_points=3):
+    points = []
+    height, width = mask.shape
+    
+    for x in range(0, width, step):
+        col = mask[:, x]
+        if np.any(col):
+            y = np.argmax(col)                   
+            points.append([x, y])
+    
+    points = np.array(points, dtype=np.float32)
+    return points if len(points) >= min_points else None
+
+
+def laser_triangulation(laser_points_2d, fx, fy, cx, cy, laser_plane_params):
+    if laser_points_2d is None or len(laser_points_2d) == 0:
+        return None
+    
+    points_3d = []
+    
+    for px, py in laser_points_2d:
+        x = (px - cx) / fx
+        y = (py - cy) / fy
+        z = 1.0
+        
+        ray = np.array([x, y, z])
+        ray = ray / np.linalg.norm(ray)
+        
+        a, b, c, d = laser_plane_params
+        denominator = np.dot([a, b, c], ray)
+        
+        if abs(denominator) < 1e-6:
+            continue
+            
+        t = -d / denominator
+        if t > 0:
+            point_3d = ray * t
+            points_3d.append(point_3d)
+    
+    return np.array(points_3d, dtype=np.float32)
+```
+
+---
+
+**Важно:**  
+Для работы функции `laser_triangulation()` необходимо предварительно откалибровать параметры камеры (`fx, fy, cx, cy`) и плоскости лазера (`laser_plane_params`). Эти значения будут сохранены в конфигурационном файле после калибровки.
+
+Модуль обеспечивает захват стереопар и генерацию 3D-точек через лазерную триангуляцию. Полная фотограмметрическая обработка выполняется на следующих этапах.
+
+---
+
 ### Архитектура системы
 
 Робототехнический комплекс мультимодальной дефектоскопии построен по **двухуровневой архитектуре** (Low-level + High-level). Такое разделение обеспечивает надёжность, реальное время на нижнем уровне и удобную высокоуровневую обработку данных.
