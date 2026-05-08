@@ -1,2 +1,168 @@
-# PanAl-Tech
-Репозиторий проект на Большие вызовы
+
+---
+
+## Модуль Ударно-Акустической Дефектоскопии (УАМ)
+
+**УАМ** — специализированный модуль для неразрушающего контроля бетонных конструкций ударно-акустическим методом. Позволяет выявлять внутренние дефекты (пустоты, расслоения, коррозию арматуры) по спектральному отпечатку колебаний после контролируемого механического удара.
+
+Существует два исполнения модуля:
+- Встраиваемый вариант (для робота)
+- **Портативный комплектный модуль серии УДАРНИК АКУСТИЧЕСКОГО ТРУДА** — для сбора обучающего датасета
+
+### Аппаратная часть
+
+- **Микроконтроллер**: ESP32-S3
+- **Соленоид**: 12 В (питается от 14 В)
+- **Управление соленоидом**: электромагнитное реле
+- **Датчик**: PZT-диск
+- **Предусилитель**: комплектный, на основе платы MAX953 
+- **АЦП**: PCM1808 (I2S)
+- **Управление**: Кнопка удара + кнопка разметки дефекта (удерживается оператором)
+
+**Параметры оцифровки:**
+- Частота дискретизации: 44100 Гц
+- Разрядность: 16 бит
+- Длительность записи одного удара: 100 мс
+
+### Пайплайн выполнения одного удара
+
+1. Оператор плотно прижимает модуль к поверхности бетона.
+2. При наличии дефекта (по визуальной оценке) удерживает кнопку разметки дефекта.
+3. Нажимает кнопку удара.
+4. Реле активирует соленоид → производится удар.
+5. Задержка 10 мс (для затухания переходных процессов).
+6. Запускается запись сигнала через PCM1808 в течение 100 мс.
+7. Данные по Wi-Fi передаются на телефон оператора.
+8. На телефоне файл автоматически сохраняется в формате `.wav` с префиксом `healthy_` или `defective_`.
+9. После завершения сбора все файлы переносятся с телефона на компьютер для обработки.
+
+### Прошивка ESP32-S3
+
+```cpp
+#include <Arduino.h>
+#include <driver/i2s.h>
+#include <WiFi.h>
+
+const int RELAY_PIN = 5;
+const int DEFECT_BTN = 6;
+const int STRIKE_BTN = 7;
+
+
+const int I2S_BCK = 26;   
+const int I2S_WS  = 25;
+const int I2S_DIN = 33;
+
+bool defectMode = false;
+
+void setup() {
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(DEFECT_BTN, INPUT_PULLUP);
+  pinMode(STRIKE_BTN, INPUT_PULLUP);
+  
+  WiFi.begin("SSID", "PASSWORD");
+  
+
+  i2s_config_t i2s_config = {
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = 44100,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 256,
+    .use_apll = false
+  };
+
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_BCK,
+    .ws_io_num = I2S_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_DIN
+  };
+
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &pin_config);
+}
+
+void loop() {
+  if (digitalRead(DEFECT_BTN) == LOW) defectMode = true;
+  
+  if (digitalRead(STRIKE_BTN) == LOW) {
+    digitalWrite(RELAY_PIN, HIGH);
+    delay(50);
+    digitalWrite(RELAY_PIN, LOW);
+    delay(10);
+    recordAndSendSignal();
+    defectMode = false;
+    delay(600);
+  }
+}
+
+void recordAndSendSignal() {
+  int16_t samples[4410];
+  size_t bytesRead;
+  
+  i2s_read(I2S_NUM_0, samples, sizeof(samples), &bytesRead, portMAX_DELAY);
+  
+  String prefix = defectMode ? "defective" : "healthy";
+  sendDataToPhone(prefix, samples, 4410);
+}
+```
+
+### Обработка сигнала и FFT
+
+После переноса данных на компьютер выполняется предобработка и спектральный анализ.
+
+```python
+# scripts/process_signal.py
+import numpy as np
+from scipy.fft import rfft, rfftfreq
+import soundfile as sf
+import os
+
+def process_file(filepath):
+    data, sr = sf.read(filepath)
+    
+
+    window = np.hanning(len(data))      
+    windowed = data * window
+    
+    
+    N = len(windowed)
+    yf = rfft(windowed)
+    xf = rfftfreq(N, 1 / sr)
+    spectrum = np.abs(yf)
+    
+
+    processed_path = filepath.replace("raw", "processed").replace(".wav", ".npy")
+    os.makedirs(os.path.dirname(processed_path), exist_ok=True)
+    np.save(processed_path, np.array([xf, spectrum]))
+    
+    return xf, spectrum
+```
+
+**Особенности спектрального анализа:**
+- **Алгоритм**: Cooley-Tukey (Fast Fourier Transform) — классический быстрый алгоритм вычисления Дискретного преобразования Фурье.
+- **Реализация**: `scipy.fft.rfft` — оптимизированная версия для реальных сигналов (использует симметрию и вычисляет только положительные частоты).
+- **Окно**: Hann (Hanning) — эффективно снижает спектральную утечку и уровень боковых лепестков.
+- **Частотное разрешение**: ≈ 10 Гц, что оптимально для анализа характерных резонансных частот бетонных конструкций.
+
+### Сбор датасета
+
+Для обучения мультимодальной нейронной сети используется **портативный комплектный модуль серии УДАРНИК АКУСТИЧЕСКОГО ТРУДА**.
+
+Оператор вручную обследует разные участки бетонных конструкций, размечает дефекты с помощью боковой кнопки и производит удары. Данные в реальном времени передаются по Wi-Fi на телефон, а затем загружаются на ПК.
+
+**Собранный датасет:**
+- Общее количество ударов: ~500
+- Healthy (здоровый бетон): ~300
+- Defective (дефектный бетон): ~200
+
+Все файлы сохраняются в формате **`.wav`** (44100 Гц, 16-bit).
+
+### Скрипты обработки
+
+- `process_signal.py` — обработка одного файла (FFT + сохранение спектра)
+
+---
