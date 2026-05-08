@@ -115,7 +115,6 @@ void recordAndSendSignal() {
 После переноса данных на компьютер выполняется предобработка и спектральный анализ.
 
 ```python
-# scripts/process_signal.py
 import numpy as np
 from scipy.fft import rfft, rfftfreq
 import soundfile as sf
